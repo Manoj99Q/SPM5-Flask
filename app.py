@@ -51,6 +51,18 @@ def build_actual_response(response):
     return response
 
 '''
+Health check endpoint
+This endpoint is used for health monitoring
+'''
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "UP",
+        "service": "Flask GitHub API Service",
+        "timestamp": str(date.today())
+    }), 200
+
+'''
 API route path is  "/api/forecast"
 This API will accept only POST request
 '''
