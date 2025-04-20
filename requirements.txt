@@ -1,0 +1,7 @@
+Flask
+github3.py
+pandas
+flask-cors
+httpx
+flask[async]
+python-dotenv
