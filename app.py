@@ -63,7 +63,7 @@ def health():
     }), 200
 
 '''
-API route path is  "/api/forecast"
+API route path is  "/api/github"
 This API will accept only POST request
 '''
 @app.route('/api/github', methods=['POST'])
@@ -71,6 +71,9 @@ def github():
     body = request.get_json()
     # Extract the choosen repositories from the request
     repo_name = body['repository']
+    # Extract the data type from the request (issues or pulls)
+    data_type = body.get('dataType', 'issues')  # Default to issues if not specified
+    
     # Add your own GitHub Token to run it local
     token = os.environ.get(
         'GITHUB_TOKEN', 'YOUR_GITHUB_TOKEN')
@@ -79,7 +82,7 @@ def github():
         "Authorization": f'token {token}'
     }
     params = {
-        "state": "open"
+        "state": "all"  # Get all issues/PRs regardless of state
     }
     repository_url = GITHUB_URL + "repos/" + repo_name
     # Fetch GitHub data from GitHub API
@@ -88,74 +91,210 @@ def github():
     repository = repository.json()
 
     today = date.today()
+    
+    # Initialize response data
+    created_at_issues = []
+    closed_at_issues = []
+    pulls_data = []
+    created_at_image_urls = {}
+    closed_at_image_urls = {}
+    pulls_image_urls = {}
 
-    issues_reponse = []
-    # Iterating to get issues for every month for the past 12 months
+    # Check if we're in development environment
+    IS_DEV_ENV = os.environ.get('FLASK_ENV', '') == 'development'
+    
+    # Use local LSTM service in dev environment, otherwise use cloud URL
+    if IS_DEV_ENV:
+        LSTM_API_URL = "http://lstm-service:8080/api/forecast"
+    else:
+        # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
+        LSTM_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "api/forecast"
+
+    # Process based on data type requested
+    if data_type == 'issues':
+        # Fetch and process only issues data
+        issues_response = fetch_github_data(repo_name, today, headers, params, 'issue')
+        
+        # Process issues data
+        df_issues = pd.DataFrame(issues_response)
+        
+        # Format issues data for frontend
+        created_at_issues, closed_at_issues = format_github_data(df_issues) if not df_issues.empty else ([], [])
+        
+        # Prepare data for LSTM forecasting
+        created_at_body = {
+            "issues": issues_response,
+            "type": "created_at",
+            "repo": repo_name.split("/")[1]
+        }
+        closed_at_body = {
+            "issues": issues_response,
+            "type": "closed_at",
+            "repo": repo_name.split("/")[1]
+        }
+        
+        # Get forecasts for created issues
+        created_at_response = requests.post(LSTM_API_URL,
+                                           json=created_at_body,
+                                           headers={'content-type': 'application/json'})
+        
+        # Get forecasts for closed issues
+        closed_at_response = requests.post(LSTM_API_URL,
+                                         json=closed_at_body,
+                                         headers={'content-type': 'application/json'})
+                                         
+        # Store responses                                 
+        created_at_image_urls = created_at_response.json()
+        closed_at_image_urls = closed_at_response.json()
+        
+    elif data_type == 'pulls':
+        # Fetch and process only pull requests data
+        pulls_response = fetch_github_data(repo_name, today, headers, params, 'pr')
+        
+        # Process pull requests data
+        df_pulls = pd.DataFrame(pulls_response)
+        
+        # Format pull requests data for frontend
+        pulls_data = format_pulls_data(df_pulls) if not df_pulls.empty else []
+        
+        # For pull requests, modify the data structure for LSTM service compatibility
+        pulls_for_lstm = []
+        for pull in pulls_response:
+            pull_modified = pull.copy()
+            pull_modified['created_at'] = pull['created_at']
+            pulls_for_lstm.append(pull_modified)
+        
+        pulls_body = {
+            "issues": pulls_for_lstm,
+            "type": "created_at",
+            "repo": repo_name.split("/")[1] + "_pulls"
+        }
+        
+        # Get forecasts for pull requests
+        try:
+            pulls_response_forecast = requests.post(LSTM_API_URL,
+                                                  json=pulls_body,
+                                                  headers={'content-type': 'application/json'})
+            pulls_image_urls = pulls_response_forecast.json()
+        except Exception as e:
+            print(f"Error getting pull request forecasts: {str(e)}")
+            pulls_image_urls = {
+                "model_loss_image_url": "",
+                "lstm_generated_image_url": "",
+                "all_issues_data_image": ""
+            }
+
+    # Create response with the requested data
+    json_response = {
+        "created": created_at_issues,
+        "closed": closed_at_issues,
+        "pulls": pulls_data,
+        "starCount": repository["stargazers_count"],
+        "forkCount": repository["forks_count"],
+        "createdAtImageUrls": created_at_image_urls,
+        "closedAtImageUrls": closed_at_image_urls,
+        "pullsImageUrls": pulls_image_urls,
+    }
+    
+    # Return the response back to client (React app)
+    return jsonify(json_response)
+
+'''
+Helper function to fetch GitHub data (issues or pull requests)
+'''
+def fetch_github_data(repo_name, today, headers, params, data_type):
+    GITHUB_URL = "https://api.github.com/"
+    response_data = []
+    
+    # Iterating to get data for every month for the past 12 months
     for i in range(12):
         last_month = today + dateutil.relativedelta.relativedelta(months=-1)
-        types = 'type:issue'
+        
+        if data_type == 'issue':
+            types = 'type:issue'
+        else:
+            types = 'type:pr'
+            
         repo = 'repo:' + repo_name
         ranges = 'created:' + str(last_month) + '..' + str(today)
-        # By default GitHub API returns only 30 results per page
-        # The maximum number of results per page is 100
-        # For more info, visit https://docs.github.com/en/rest/reference/repos 
         per_page = 'per_page=100'
+        
         # Search query will create a query to fetch data for a given repository in a given time range
         search_query = types + ' ' + repo + ' ' + ranges
 
         # Append the search query to the GitHub API URL 
         query_url = GITHUB_URL + "search/issues?q=" + search_query + "&" + per_page
+        
         # requsets.get will fetch requested query_url from the GitHub API
-        search_issues = requests.get(query_url, headers=headers, params=params)
+        search_results = requests.get(query_url, headers=headers, params=params)
+        
         # Convert the data obtained from GitHub API to JSON format
-        search_issues = search_issues.json()
-        issues_items = []
+        search_results = search_results.json()
+        results_items = []
+        
         try:
-            # Extract "items" from search issues
-            issues_items = search_issues.get("items")
+            # Extract "items" from search results
+            results_items = search_results.get("items")
         except KeyError:
             error = {"error": "Data Not Available"}
             resp = Response(json.dumps(error), mimetype='application/json')
             resp.status_code = 500
             return resp
-        if issues_items is None:
+            
+        if results_items is None:
             continue
-        for issue in issues_items:
+            
+        for item in results_items:
             label_name = []
             data = {}
-            current_issue = issue
-            # Get issue number
-            data['issue_number'] = current_issue["number"]
-            # Get created date of issue
-            data['created_at'] = current_issue["created_at"][0:10]
-            if current_issue["closed_at"] == None:
-                data['closed_at'] = current_issue["closed_at"]
+            current_item = item
+            
+            # Get issue/PR number
+            data['issue_number'] = current_item["number"]
+            
+            # Get created date
+            data['created_at'] = current_item["created_at"][0:10]
+            
+            if current_item["closed_at"] == None:
+                data['closed_at'] = current_item["closed_at"]
             else:
-                # Get closed date of issue
-                data['closed_at'] = current_issue["closed_at"][0:10]
-            for label in current_issue["labels"]:
-                # Get label name of issue
+                # Get closed date
+                data['closed_at'] = current_item["closed_at"][0:10]
+                
+            for label in current_item["labels"]:
+                # Get label name
                 label_name.append(label["name"])
+                
             data['labels'] = label_name
-            # It gives state of issue like closed or open
-            data['State'] = current_issue["state"]
-            # Get Author of issue
-            data['Author'] = current_issue["user"]["login"]
-            issues_reponse.append(data)
+            
+            # It gives state like closed or open
+            data['State'] = current_item["state"]
+            
+            # Get Author
+            data['Author'] = current_item["user"]["login"]
+            
+            # Add a flag to identify if it's a pull request
+            data['is_pull_request'] = 'pull_request' in current_item
+            
+            response_data.append(data)
 
         today = last_month
+        
+    return response_data
 
-    df = pd.DataFrame(issues_reponse)
-
+'''
+Helper function to format GitHub issues data for the frontend
+'''
+def format_github_data(df):
+    if df.empty:
+        return [], []
+        
     # Daily Created Issues
     df_created_at = df.groupby(['created_at'], as_index=False).count()
     dataFrameCreated = df_created_at[['created_at', 'issue_number']]
     dataFrameCreated.columns = ['date', 'count']
 
-    '''
-    Monthly Created Issues
-    Format the data by grouping the data by month
-    ''' 
+    # Monthly Created Issues
     created_at = df['created_at']
     month_issue_created = pd.to_datetime(
         pd.Series(created_at), format='%Y-%m-%d')
@@ -169,89 +308,56 @@ def github():
         array = [str(key), month_issue_created_dict[key]]
         created_at_issues.append(array)
 
-    '''
-    Monthly Closed Issues
-    Format the data by grouping the data by month
-    ''' 
-    
+    # Monthly Closed Issues
     closed_at = df['closed_at'].sort_values(ascending=True)
-    month_issue_closed = pd.to_datetime(
-        pd.Series(closed_at), format='%Y-%m-%d')
-    month_issue_closed.index = month_issue_closed.dt.to_period('m')
-    month_issue_closed = month_issue_closed.groupby(level=0).size()
-    month_issue_closed = month_issue_closed.reindex(pd.period_range(
-        month_issue_closed.index.min(), month_issue_closed.index.max(), freq='m'), fill_value=0)
-    month_issue_closed_dict = month_issue_closed.to_dict()
-    closed_at_issues = []
-    for key in month_issue_closed_dict.keys():
-        array = [str(key), month_issue_closed_dict[key]]
-        closed_at_issues.append(array)
-
-    '''
-        1. Hit LSTM Microservice by passing issues_response as body
-        2. LSTM Microservice will give a list of string containing image paths hosted on google cloud storage
-        3. On recieving a valid response from LSTM Microservice, append the above json_response with the response from
-            LSTM microservice
-    '''
-    created_at_body = {
-        "issues": issues_reponse,
-        "type": "created_at",
-        "repo": repo_name.split("/")[1]
-    }
-    closed_at_body = {
-        "issues": issues_reponse,
-        "type": "closed_at",
-        "repo": repo_name.split("/")[1]
-    }
-
-    # Check if we're in development environment
-    IS_DEV_ENV = os.environ.get('FLASK_ENV', '') == 'development'
+    # Filter out None values
+    closed_at = closed_at[closed_at.notnull()]
     
-    # Use local LSTM service in dev environment, otherwise use cloud URL
-    if IS_DEV_ENV:
-        LSTM_API_URL = "http://lstm-service:8080/api/forecast"
+    if len(closed_at) > 0:
+        month_issue_closed = pd.to_datetime(
+            pd.Series(closed_at), format='%Y-%m-%d')
+        month_issue_closed.index = month_issue_closed.dt.to_period('m')
+        month_issue_closed = month_issue_closed.groupby(level=0).size()
+        month_issue_closed = month_issue_closed.reindex(pd.period_range(
+            month_issue_closed.index.min(), month_issue_closed.index.max(), freq='m'), fill_value=0)
+        month_issue_closed_dict = month_issue_closed.to_dict()
+        closed_at_issues = []
+        for key in month_issue_closed_dict.keys():
+            array = [str(key), month_issue_closed_dict[key]]
+            closed_at_issues.append(array)
     else:
-        # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
-        LSTM_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "api/forecast"
+        closed_at_issues = []
+        
+    return created_at_issues, closed_at_issues
 
-    '''
-    Trigger the LSTM microservice to forecasted the created issues
-    The request body consists of created issues obtained from GitHub API in JSON format
-    The response body consists of Google cloud storage path of the images generated by LSTM microservice
-    '''
-    created_at_response = requests.post(LSTM_API_URL,
-                                        json=created_at_body,
-                                        headers={'content-type': 'application/json'})
+'''
+Helper function to format pull requests data for the frontend
+'''
+def format_pulls_data(df):
+    if df.empty:
+        return []
+        
+    # Filter only pull requests
+    df_pulls = df[df['is_pull_request'] == True]
     
-    '''
-    Trigger the LSTM microservice to forecasted the closed issues
-    The request body consists of closed issues obtained from GitHub API in JSON format
-    The response body consists of Google cloud storage path of the images generated by LSTM microservice
-    '''    
-    closed_at_response = requests.post(LSTM_API_URL,
-                                       json=closed_at_body,
-                                       headers={'content-type': 'application/json'})
-    
-    '''
-    Create the final response that consists of:
-        1. GitHub repository data obtained from GitHub API
-        2. Google cloud image urls of created and closed issues obtained from LSTM microservice
-    '''
-    json_response = {
-        "created": created_at_issues,
-        "closed": closed_at_issues,
-        "starCount": repository["stargazers_count"],
-        "forkCount": repository["forks_count"],
-        "createdAtImageUrls": {
-            **created_at_response.json(),
-        },
-        "closedAtImageUrls": {
-            **closed_at_response.json(),
-        },
-    }
-    # Return the response back to client (React app)
-    return jsonify(json_response)
-
+    if df_pulls.empty:
+        return []
+        
+    # Monthly Pull Requests
+    created_at = df_pulls['created_at']
+    month_pulls_created = pd.to_datetime(
+        pd.Series(created_at), format='%Y-%m-%d')
+    month_pulls_created.index = month_pulls_created.dt.to_period('m')
+    month_pulls_created = month_pulls_created.groupby(level=0).size()
+    month_pulls_created = month_pulls_created.reindex(pd.period_range(
+        month_pulls_created.index.min(), month_pulls_created.index.max(), freq='m'), fill_value=0)
+    month_pulls_created_dict = month_pulls_created.to_dict()
+    pulls_data = []
+    for key in month_pulls_created_dict.keys():
+        array = [str(key), month_pulls_created_dict[key]]
+        pulls_data.append(array)
+        
+    return pulls_data
 
 # Run flask app server on port 5000
 if __name__ == '__main__':
