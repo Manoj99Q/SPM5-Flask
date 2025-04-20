@@ -204,8 +204,15 @@ def github():
         "repo": repo_name.split("/")[1]
     }
 
-    # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
-    LSTM_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "api/forecast"
+    # Check if we're in development environment
+    IS_DEV_ENV = os.environ.get('FLASK_ENV', '') == 'development'
+    
+    # Use local LSTM service in dev environment, otherwise use cloud URL
+    if IS_DEV_ENV:
+        LSTM_API_URL = "http://lstm-service:8080/api/forecast"
+    else:
+        # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
+        LSTM_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "api/forecast"
 
     '''
     Trigger the LSTM microservice to forecasted the created issues
