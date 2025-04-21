@@ -475,6 +475,208 @@ def format_contributors_data(df):
     return contributors_data
 
 '''
+Helper function to fetch GitHub releases data using GraphQL API
+'''
+def fetch_github_releases(repo_name, headers):
+    GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+    response_data = []
+    
+    try:
+        # Split repository name
+        owner, name = repo_name.split('/')
+        
+        print(f"Fetching releases for {owner}/{name}")
+        
+        # First check if the repository exists and has releases using a simpler query
+        check_query = """
+        {
+          repository(owner: "%s", name: "%s") {
+            releases(first: 1) {
+              totalCount
+            }
+          }
+        }
+        """ % (owner, name)
+        
+        # Make POST request to GitHub GraphQL API
+        check_response = requests.post(
+            GITHUB_GRAPHQL_URL,
+            json={"query": check_query},
+            headers=headers
+        )
+        
+        check_result = check_response.json()
+        
+        # Check if repository has releases
+        if 'errors' in check_result:
+            print(f"GraphQL Error checking releases: {check_result['errors']}")
+            return []
+        
+        try:
+            total_releases = check_result.get('data', {}).get('repository', {}).get('releases', {}).get('totalCount', 0)
+            print(f"Repository has {total_releases} releases")
+            
+            if total_releases == 0:
+                print("No releases found for this repository")
+                return []
+        except Exception as e:
+            print(f"Error checking release count: {str(e)}")
+            return []
+        
+        # Variables for pagination
+        has_next_page = True
+        cursor = None
+        release_count = 0
+        
+        # Retrieve releases with pagination (no limit - fetch all)
+        while has_next_page:
+            # Construct the cursor part of the query
+            cursor_string = f', after: "{cursor}"' if cursor else ''
+            
+            # GraphQL query to fetch releases with publication date
+            query = """
+            {
+              repository(owner: "%s", name: "%s") {
+                releases(first: 100%s, orderBy: {field: CREATED_AT, direction: DESC}) {
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                  nodes {
+                    name
+                    tagName
+                    createdAt
+                    publishedAt
+                    isPrerelease
+                    isDraft
+                  }
+                }
+              }
+            }
+            """ % (owner, name, cursor_string)
+            
+            # Make POST request to GitHub GraphQL API
+            graphql_response = requests.post(
+                GITHUB_GRAPHQL_URL,
+                json={"query": query},
+                headers=headers
+            )
+            
+            # Process response
+            try:
+                result = graphql_response.json()
+                
+                if 'errors' in result:
+                    print(f"GraphQL Error: {result['errors']}")
+                    break
+                    
+                releases = result.get('data', {}).get('repository', {}).get('releases', {})
+                release_nodes = releases.get('nodes', [])
+                page_info = releases.get('pageInfo', {})
+                
+                # Extract pagination info
+                has_next_page = page_info.get('hasNextPage', False)
+                cursor = page_info.get('endCursor')
+                
+                batch_size = len(release_nodes)
+                release_count += batch_size
+                
+                print(f"Fetched {batch_size} releases, total so far: {release_count}")
+                
+                if batch_size == 0:
+                    break
+                
+                for release in release_nodes:
+                    data = {}
+                    data['release_name'] = release.get('name', '')
+                    data['tag_name'] = release.get('tagName', '')
+                    
+                    # Use publishedAt if available, otherwise use createdAt
+                    if release.get('publishedAt'):
+                        data['created_at'] = release.get('publishedAt', '')[:10]  # Just keep the date part
+                    else:
+                        data['created_at'] = release.get('createdAt', '')[:10]  # Just keep the date part
+                    
+                    data['is_prerelease'] = release.get('isPrerelease', False)
+                    data['is_draft'] = release.get('isDraft', False)
+                    
+                    response_data.append(data)
+                    
+                # If we got fewer than 100 releases, there are no more to fetch
+                if batch_size < 100:
+                    has_next_page = False
+                    
+            except Exception as e:
+                print(f"Error processing releases batch: {str(e)}")
+                has_next_page = False
+        
+        print(f"Successfully fetched {release_count} releases for {owner}/{name}")
+        
+    except Exception as e:
+        print(f"Error in fetch_github_releases: {str(e)}")
+    
+    return response_data
+
+# Add a new function to handle the case where the DataFrame is empty or has no valid dates
+def safe_format_releases_data(df):
+    try:
+        if df.empty:
+            print("Releases DataFrame is empty")
+            return []
+            
+        if 'created_at' not in df.columns:
+            print("No 'created_at' column in releases DataFrame")
+            return []
+            
+        # Check for null or empty created_at values
+        df = df.dropna(subset=['created_at'])
+        
+        if df.empty:
+            print("No valid dates in releases DataFrame after dropping NAs")
+            return []
+            
+        # Monthly Releases - exactly like monthly commits formatting
+        release_dates = df['created_at']
+        
+        # Debug information
+        print(f"Release dates: {release_dates.tolist()}")
+        
+        month_releases = pd.to_datetime(
+            pd.Series(release_dates), format='%Y-%m-%d', errors='coerce')
+            
+        # Check if we have valid dates after conversion
+        invalid_dates = month_releases.isna().sum()
+        if invalid_dates > 0:
+            print(f"Warning: {invalid_dates} invalid dates found and will be dropped")
+            month_releases = month_releases.dropna()
+            
+        if len(month_releases) == 0:
+            print("No valid dates after conversion")
+            return []
+            
+        month_releases.index = month_releases.dt.to_period('m')
+        month_releases = month_releases.groupby(level=0).size()
+        
+        if len(month_releases) == 0:
+            print("No releases after grouping by month")
+            return []
+            
+        month_releases = month_releases.reindex(pd.period_range(
+            month_releases.index.min(), month_releases.index.max(), freq='m'), fill_value=0)
+        month_releases_dict = month_releases.to_dict()
+        releases_data = []
+        for key in month_releases_dict.keys():
+            array = [str(key), month_releases_dict[key]]
+            releases_data.append(array)
+            
+        print(f"Formatted {len(releases_data)} months of release data")
+        return releases_data
+        
+    except Exception as e:
+        print(f"Error in format_releases_data: {str(e)}")
+        return []
+
+'''
 API route path is  "/api/github"
 This API will accept only POST request
 '''
@@ -483,9 +685,9 @@ def github():
     body = request.get_json()
     # Extract the choosen repositories from the request
     repo_name = body['repository']
-    # Extract the data type from the request (issues, pulls, commits, or branches)
+    # Extract the data type from the request (issues, pulls, commits, branches, releases)
     data_type = body.get('dataType', 'issues')  # Default to issues if not specified
-    # Extract the model type from the request (lstm or statsmodel)
+    # Extract the model type from the request (lstm, statsmodel, or prophet)
     model_type = body.get('modelType', 'lstm')  # Default to lstm if not specified
     
     # Add your own GitHub Token to run it local
@@ -513,12 +715,14 @@ def github():
     commits_data = []
     branches_data = []
     contributors_data = []
+    releases_data = []
     created_at_image_urls = {}
     closed_at_image_urls = {}
     pulls_image_urls = {}
     commits_image_urls = {}
     branches_image_urls = {}
     contributors_image_urls = {}
+    releases_image_urls = {}
 
     # Check if we're in development environment
     IS_DEV_ENV = os.environ.get('FLASK_ENV', '') == 'development'
@@ -772,6 +976,127 @@ def github():
                     "all_issues_data_image": ""
                 }
 
+    elif data_type == 'releases':
+        try:
+            print(f"Processing releases data for {repo_name}")
+            
+            # Fetch and process releases data using GraphQL API
+            releases_response = fetch_github_releases(repo_name, headers)
+            print(f"Fetched {len(releases_response)} releases")
+            
+            # Format releases data for frontend directly from the response
+            releases_data = []
+            
+            if releases_response:
+                # Format similar to branches & contributors
+                release_dates = [release.get('created_at', '') for release in releases_response if release.get('created_at', '')]
+                if release_dates:
+                    try:
+                        month_releases = pd.to_datetime(pd.Series(release_dates), format='%Y-%m-%d', errors='coerce')
+                        month_releases = month_releases.dropna()  # Remove invalid dates
+                        
+                        if not month_releases.empty:
+                            month_releases.index = month_releases.dt.to_period('m')
+                            month_releases = month_releases.groupby(level=0).size()
+                            month_releases = month_releases.reindex(pd.period_range(
+                                month_releases.index.min(), month_releases.index.max(), freq='m'), fill_value=0)
+                            month_releases_dict = month_releases.to_dict()
+                            
+                            for key in month_releases_dict.keys():
+                                array = [str(key), month_releases_dict[key]]
+                                releases_data.append(array)
+                            
+                            print(f"Formatted {len(releases_data)} months of release data")
+                        else:
+                            print("No valid dates after conversion")
+                    except Exception as e:
+                        print(f"Error formatting releases data: {str(e)}")
+            else:
+                print("No releases data to format")
+            
+            # Prepare data for forecasting service (only if we have releases)
+            if releases_response:
+                # Create data for forecasting
+                releases_for_forecast = []
+                for release in releases_response:
+                    try:
+                        release_modified = {}
+                        tag_name = release.get('tag_name', '')
+                        if not tag_name:
+                            tag_name = release.get('release_name', f"release_{len(releases_for_forecast)}")
+                        
+                        release_modified['issue_number'] = tag_name[:8] if len(tag_name) > 8 else tag_name
+                        
+                        created_at = release.get('created_at', '')
+                        if not created_at:
+                            continue  # Skip releases without dates
+                            
+                        release_modified['created_at'] = created_at
+                        releases_for_forecast.append(release_modified)
+                    except Exception as e:
+                        print(f"Error processing release for forecast: {str(e)}")
+                
+                print(f"Prepared {len(releases_for_forecast)} releases for forecasting")
+                
+                # Only attempt forecast if we have enough data
+                if len(releases_for_forecast) >= 5:  # Minimum data points for meaningful forecast
+                    releases_body = {
+                        "issues": releases_for_forecast,
+                        "type": "created_at",
+                        "repo": repo_name.split("/")[1] + "_releases"
+                    }
+                    
+                    # Get forecasts for releases
+                    try:
+                        print(f"Sending forecast request to {FORECAST_API_URL}")
+                        releases_response_forecast = requests.post(
+                            FORECAST_API_URL,
+                            json=releases_body,
+                            headers={'content-type': 'application/json'},
+                            timeout=30
+                        )
+                        
+                        if releases_response_forecast.status_code == 200:
+                            releases_image_urls = releases_response_forecast.json()
+                            print("Successfully received forecast images")
+                        else:
+                            print(f"Error response from forecast service: {releases_response_forecast.status_code}")
+                            # Set default image URLs
+                            releases_image_urls = {
+                                "model_loss_image_url": "",
+                                "lstm_generated_image_url": "",
+                                "all_issues_data_image": ""
+                            }
+                    except Exception as e:
+                        print(f"Error getting releases forecasts: {str(e)}")
+                        releases_image_urls = {
+                            "model_loss_image_url": "",
+                            "lstm_generated_image_url": "",
+                            "all_issues_data_image": ""
+                        }
+                else:
+                    print(f"Not enough release data for forecasting (need 5, have {len(releases_for_forecast)})")
+                    releases_image_urls = {
+                        "model_loss_image_url": "",
+                        "lstm_generated_image_url": "",
+                        "all_issues_data_image": ""
+                    }
+            else:
+                print("No releases data for forecasting")
+                releases_image_urls = {
+                    "model_loss_image_url": "",
+                    "lstm_generated_image_url": "",
+                    "all_issues_data_image": ""
+                }
+        except Exception as e:
+            print(f"Error in releases processing: {str(e)}")
+            releases_data = []
+            releases_image_urls = {
+                "model_loss_image_url": "",
+                "lstm_generated_image_url": "",
+                "all_issues_data_image": ""
+            }
+
     # Create response with the requested data
     json_response = {
         "created": created_at_issues,
@@ -780,6 +1105,7 @@ def github():
         "commits": commits_data,
         "branches": branches_data,
         "contributors": contributors_data,
+        "releases": releases_data,
         "starCount": repository["stargazers_count"],
         "forkCount": repository["forks_count"],
         "createdAtImageUrls": created_at_image_urls,
@@ -788,6 +1114,7 @@ def github():
         "commitsImageUrls": commits_image_urls,
         "branchesImageUrls": branches_image_urls,
         "contributorsImageUrls": contributors_image_urls,
+        "releasesImageUrls": releases_image_urls,
     }
     
     # Return the response back to client (React app)
