@@ -86,8 +86,8 @@ def fetch_github_commits(repo_name, today, headers, months=12):
         cursor = None
         month_commit_count = 0
         
-        # Retrieve commits with pagination (up to 500 per month)
-        while has_next_page and month_commit_count < 500:
+        # Retrieve commits with pagination (no limit - fetch all)
+        while has_next_page:
             # Construct the cursor part of the query
             cursor_string = f', after: "{cursor}"' if cursor else ''
             
@@ -202,6 +202,133 @@ def format_commits_data(df):
     return commits_data
 
 '''
+Helper function to fetch GitHub branches data using GraphQL API
+'''
+def fetch_github_branches(repo_name, headers):
+    GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+    response_data = []
+    
+    # Split repository name
+    owner, name = repo_name.split('/')
+    
+    # Variables for pagination
+    has_next_page = True
+    cursor = None
+    branch_count = 0
+    
+    # Retrieve branches with pagination (no limit - fetch all)
+    while has_next_page:
+        # Construct the cursor part of the query
+        cursor_string = f', after: "{cursor}"' if cursor else ''
+        
+        # GraphQL query to fetch branches with creation date
+        # We're using the creation date of the first commit as a proxy for branch creation
+        query = """
+        {
+          repository(owner: "%s", name: "%s") {
+            refs(refPrefix: "refs/heads/", first: 100%s) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                name
+                target {
+                  ... on Commit {
+                    history(first: 1) {
+                      nodes {
+                        committedDate
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """ % (owner, name, cursor_string)
+        
+        # Make POST request to GitHub GraphQL API
+        graphql_response = requests.post(
+            GITHUB_GRAPHQL_URL,
+            json={"query": query},
+            headers=headers
+        )
+        
+        # Process response
+        try:
+            result = graphql_response.json()
+            
+            if 'errors' in result:
+                print(f"GraphQL Error: {result['errors']}")
+                break
+                
+            refs = result.get('data', {}).get('repository', {}).get('refs', {})
+            branches = refs.get('nodes', [])
+            page_info = refs.get('pageInfo', {})
+            
+            # Extract pagination info
+            has_next_page = page_info.get('hasNextPage', False)
+            cursor = page_info.get('endCursor')
+            
+            batch_size = len(branches)
+            branch_count += batch_size
+            
+            if batch_size == 0:
+                break
+            
+            for branch in branches:
+                data = {}
+                # Generate a unique ID for the branch (similar to commit_hash for commits)
+                data['branch_name'] = branch['name']
+                
+                # Get branch creation date from first commit
+                target = branch.get('target', {})
+                history = target.get('history', {}).get('nodes', [])
+                
+                if history and len(history) > 0:
+                    # Format consistent with the commits dates
+                    data['created_at'] = history[0].get('committedDate', '')[:10]
+                else:
+                    # Skip branches with no creation date
+                    continue
+                
+                response_data.append(data)
+                
+            # If we got fewer than 100 branches, there are no more to fetch
+            if batch_size < 100:
+                has_next_page = False
+                
+        except Exception as e:
+            print(f"Error processing branches: {str(e)}")
+            has_next_page = False
+    
+    return response_data
+
+'''
+Helper function to format GitHub branches data for the frontend
+'''
+def format_branches_data(df):
+    if df.empty:
+        return []
+        
+    # Monthly Branches - exactly like monthly commits formatting
+    branch_dates = df['created_at']
+    month_branches = pd.to_datetime(
+        pd.Series(branch_dates), format='%Y-%m-%d')
+    month_branches.index = month_branches.dt.to_period('m')
+    month_branches = month_branches.groupby(level=0).size()
+    month_branches = month_branches.reindex(pd.period_range(
+        month_branches.index.min(), month_branches.index.max(), freq='m'), fill_value=0)
+    month_branches_dict = month_branches.to_dict()
+    branches_data = []
+    for key in month_branches_dict.keys():
+        array = [str(key), month_branches_dict[key]]
+        branches_data.append(array)
+        
+    return branches_data
+
+'''
 API route path is  "/api/github"
 This API will accept only POST request
 '''
@@ -210,7 +337,7 @@ def github():
     body = request.get_json()
     # Extract the choosen repositories from the request
     repo_name = body['repository']
-    # Extract the data type from the request (issues, pulls, or commits)
+    # Extract the data type from the request (issues, pulls, commits, or branches)
     data_type = body.get('dataType', 'issues')  # Default to issues if not specified
     # Extract the model type from the request (lstm or statsmodel)
     model_type = body.get('modelType', 'lstm')  # Default to lstm if not specified
@@ -238,10 +365,12 @@ def github():
     closed_at_issues = []
     pulls_data = []
     commits_data = []
+    branches_data = []
     created_at_image_urls = {}
     closed_at_image_urls = {}
     pulls_image_urls = {}
     commits_image_urls = {}
+    branches_image_urls = {}
 
     # Check if we're in development environment
     IS_DEV_ENV = os.environ.get('FLASK_ENV', '') == 'development'
@@ -341,12 +470,11 @@ def github():
                     "lstm_generated_image_url": "",
                     "all_issues_data_image": ""
                 }
-            else:  # statsmodel
+            else:  # statsmodel or prophet
                 pulls_image_urls = {
-                    "model_diag_image_url": "",
-                    "forecast_image_url": "",
-                    "all_data_image_url": "",
-                    "forecast_values": []
+                    "model_loss_image_url": "",
+                    "lstm_generated_image_url": "",
+                    "all_issues_data_image": ""
                 }
     
     elif data_type == 'commits':
@@ -388,12 +516,76 @@ def github():
                     "lstm_generated_image_url": "",
                     "all_issues_data_image": ""
                 }
-            else:  # statsmodel
+            else:  # statsmodel or prophet
                 commits_image_urls = {
                     "model_loss_image_url": "",
                     "lstm_generated_image_url": "",
                     "all_issues_data_image": ""
                 }
+                
+    elif data_type == 'branches':
+        # Fetch and process branches data using GraphQL API
+        branches_response = fetch_github_branches(repo_name, headers)
+        
+        # Process branches data
+        df_branches = pd.DataFrame(branches_response)
+        
+        # Format branches data for frontend
+        branches_data = format_branches_data(df_branches) if not df_branches.empty else []
+        
+        # Prepare data for forecasting service - structure exactly like commits
+        branches_for_forecast = []
+        for branch in branches_response:
+            branch_modified = {}
+            branch_modified['issue_number'] = branch['branch_name'][:8] if len(branch['branch_name']) > 8 else branch['branch_name']  # Use branch name as ID
+            branch_modified['created_at'] = branch['created_at']  # Use creation date
+            branches_for_forecast.append(branch_modified)
+        
+        # Only proceed with forecast if we have sufficient data (at least 50 data points)
+        if len(branches_for_forecast) >= 50:
+            branches_body = {
+                "issues": branches_for_forecast,
+                "type": "created_at",
+                "repo": repo_name.split("/")[1] + "_branches"
+            }
+            
+            # Get forecasts for branches
+            try:
+                branches_response_forecast = requests.post(FORECAST_API_URL,
+                                                       json=branches_body,
+                                                       headers={'content-type': 'application/json'})
+                if branches_response_forecast.status_code == 200:
+                    try:
+                        branches_image_urls = branches_response_forecast.json()
+                    except:
+                        print("Error decoding JSON from LSTM service for branches")
+                        branches_image_urls = {
+                            "model_loss_image_url": "",
+                            "lstm_generated_image_url": "",
+                            "all_issues_data_image": ""
+                        }
+                else:
+                    branches_image_urls = {
+                        "model_loss_image_url": "",
+                        "lstm_generated_image_url": "",
+                        "all_issues_data_image": ""
+                    }
+            except Exception as e:
+                print(f"Error getting branches forecasts: {str(e)}")
+                # Set default image URLs based on model type
+                branches_image_urls = {
+                    "model_loss_image_url": "",
+                    "lstm_generated_image_url": "",
+                    "all_issues_data_image": ""
+                }
+        else:
+            print(f"Not enough branch data for forecasting: {len(branches_for_forecast)} points (minimum 50 required)")
+            # Set default empty image URLs if insufficient data
+            branches_image_urls = {
+                "model_loss_image_url": "",
+                "lstm_generated_image_url": "",
+                "all_issues_data_image": ""
+            }
 
     # Create response with the requested data
     json_response = {
@@ -401,12 +593,14 @@ def github():
         "closed": closed_at_issues,
         "pulls": pulls_data,
         "commits": commits_data,
+        "branches": branches_data,
         "starCount": repository["stargazers_count"],
         "forkCount": repository["forks_count"],
         "createdAtImageUrls": created_at_image_urls,
         "closedAtImageUrls": closed_at_image_urls,
         "pullsImageUrls": pulls_image_urls,
         "commitsImageUrls": commits_image_urls,
+        "branchesImageUrls": branches_image_urls,
     }
     
     # Return the response back to client (React app)
@@ -440,8 +634,8 @@ def fetch_github_data(repo_name, today, headers, params, data_type):
         has_more_pages = True
         month_item_count = 0
         
-        # Get up to 500 items per month with pagination
-        while has_more_pages and month_item_count < 500:
+        # Get all items per month with pagination (no limit)
+        while has_more_pages:
             # Append the search query to the GitHub API URL 
             query_url = GITHUB_URL + f"search/issues?q={search_query}&{per_page}&page={page}"
             
@@ -500,7 +694,7 @@ def fetch_github_data(repo_name, today, headers, params, data_type):
                 
                 # Check if we have more pages
                 page += 1
-                has_more_pages = batch_size == 100 and month_item_count < total_count
+                has_more_pages = batch_size == 100
                     
             except KeyError as e:
                 print(f"API Error: {str(e)}")
