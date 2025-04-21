@@ -253,12 +253,18 @@ def github():
         else:
             # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
             FORECAST_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "forecast-lstm"
-    else:  # statsmodel
+    elif model_type == 'statsmodel':
         if IS_DEV_ENV:
             FORECAST_API_URL = "http://lstm-service:8080/forecast-statsmodel"
         else:
             # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
             FORECAST_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "forecast-statsmodel"
+    else:  # prophet
+        if IS_DEV_ENV:
+            FORECAST_API_URL = "http://lstm-service:8080/forecast-prophet"
+        else:
+            # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
+            FORECAST_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "forecast-prophet"
     
     # Process based on data type requested
     if data_type == 'issues':
