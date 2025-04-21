@@ -329,6 +329,152 @@ def format_branches_data(df):
     return branches_data
 
 '''
+Helper function to fetch GitHub contributors data using GraphQL API
+'''
+def fetch_github_contributors(repo_name, today, headers, months=12):
+    GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+    response_data = []
+    
+    # Split repository name
+    owner, name = repo_name.split('/')
+    
+    # Calculate date threshold for the beginning of our search
+    start_date = today + dateutil.relativedelta.relativedelta(months=-months)
+    start_date_str = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    # Variables for pagination
+    has_next_page = True
+    cursor = None
+    contributor_count = 0
+    
+    # Store all unique contributors with their first contribution date
+    contributor_first_dates = {}
+    
+    # Retrieve commits with pagination to find contributors
+    while has_next_page:
+        # Construct the cursor part of the query
+        cursor_string = f', after: "{cursor}"' if cursor else ''
+        
+        # GraphQL query to fetch commits with author information
+        query = """
+        {
+          repository(owner: "%s", name: "%s") {
+            defaultBranchRef {
+              target {
+                ... on Commit {
+                  history(first: 100%s, since: "%s") {
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                    nodes {
+                      committedDate
+                      author {
+                        user {
+                          login
+                        }
+                        email
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """ % (owner, name, cursor_string, start_date_str)
+        
+        # Make POST request to GitHub GraphQL API
+        graphql_response = requests.post(
+            GITHUB_GRAPHQL_URL,
+            json={"query": query},
+            headers=headers
+        )
+        
+        # Process response
+        try:
+            result = graphql_response.json()
+            
+            if 'errors' in result:
+                print(f"GraphQL Error: {result['errors']}")
+                break
+                
+            history = result.get('data', {}).get('repository', {}).get('defaultBranchRef', {}).get('target', {}).get('history', {})
+            commits = history.get('nodes', [])
+            page_info = history.get('pageInfo', {})
+            
+            # Extract pagination info
+            has_next_page = page_info.get('hasNextPage', False)
+            cursor = page_info.get('endCursor')
+            
+            batch_size = len(commits)
+            
+            if batch_size == 0:
+                break
+            
+            # Process each commit to find contributors
+            for commit in commits:
+                committed_date = commit.get('committedDate')
+                
+                # Determine the author identifier (username, email, or name)
+                author = None
+                if commit['author'].get('user') and commit['author']['user'].get('login'):
+                    author = commit['author']['user']['login']
+                elif commit['author'].get('email'):
+                    author = commit['author']['email']
+                elif commit['author'].get('name'):
+                    author = commit['author']['name']
+                else:
+                    author = 'unknown'
+                
+                # Record the earliest date for each contributor
+                if author and committed_date:
+                    commit_date = datetime.strptime(committed_date, "%Y-%m-%dT%H:%M:%SZ").date()
+                    if author not in contributor_first_dates or commit_date < contributor_first_dates[author]:
+                        contributor_first_dates[author] = commit_date
+            
+            # If we got fewer than 100 commits, there are no more to fetch
+            if batch_size < 100:
+                has_next_page = False
+                
+        except Exception as e:
+            print(f"Error processing contributors: {str(e)}")
+            has_next_page = False
+    
+    # Convert the contributor data to the expected format
+    for author, first_date in contributor_first_dates.items():
+        data = {}
+        data['contributor_name'] = author
+        data['first_contribution_date'] = first_date.strftime("%Y-%m-%d")
+        response_data.append(data)
+    
+    return response_data
+
+'''
+Helper function to format GitHub contributors data for the frontend
+'''
+def format_contributors_data(df):
+    if df.empty:
+        return []
+    
+    # Monthly new contributors
+    contribution_dates = df['first_contribution_date']
+    month_contributors = pd.to_datetime(
+        pd.Series(contribution_dates), format='%Y-%m-%d')
+    month_contributors.index = month_contributors.dt.to_period('m')
+    month_contributors = month_contributors.groupby(level=0).size()
+    month_contributors = month_contributors.reindex(pd.period_range(
+        month_contributors.index.min(), month_contributors.index.max(), freq='m'), fill_value=0)
+    month_contributors_dict = month_contributors.to_dict()
+    contributors_data = []
+    for key in month_contributors_dict.keys():
+        array = [str(key), month_contributors_dict[key]]
+        contributors_data.append(array)
+    
+    return contributors_data
+
+'''
 API route path is  "/api/github"
 This API will accept only POST request
 '''
@@ -366,11 +512,13 @@ def github():
     pulls_data = []
     commits_data = []
     branches_data = []
+    contributors_data = []
     created_at_image_urls = {}
     closed_at_image_urls = {}
     pulls_image_urls = {}
     commits_image_urls = {}
     branches_image_urls = {}
+    contributors_image_urls = {}
 
     # Check if we're in development environment
     IS_DEV_ENV = os.environ.get('FLASK_ENV', '') == 'development'
@@ -541,51 +689,88 @@ def github():
             branch_modified['created_at'] = branch['created_at']  # Use creation date
             branches_for_forecast.append(branch_modified)
         
-        # Only proceed with forecast if we have sufficient data (at least 50 data points)
-        if len(branches_for_forecast) >= 50:
-            branches_body = {
-                "issues": branches_for_forecast,
-                "type": "created_at",
-                "repo": repo_name.split("/")[1] + "_branches"
-            }
-            
-            # Get forecasts for branches
-            try:
-                branches_response_forecast = requests.post(FORECAST_API_URL,
-                                                       json=branches_body,
-                                                       headers={'content-type': 'application/json'})
-                if branches_response_forecast.status_code == 200:
-                    try:
-                        branches_image_urls = branches_response_forecast.json()
-                    except:
-                        print("Error decoding JSON from LSTM service for branches")
-                        branches_image_urls = {
-                            "model_loss_image_url": "",
-                            "lstm_generated_image_url": "",
-                            "all_issues_data_image": ""
-                        }
-                else:
+        # Removed 50-point limitation: Always attempt forecasting regardless of data size
+        branches_body = {
+            "issues": branches_for_forecast,
+            "type": "created_at",
+            "repo": repo_name.split("/")[1] + "_branches"
+        }
+        
+        # Get forecasts for branches
+        try:
+            branches_response_forecast = requests.post(FORECAST_API_URL,
+                                                    json=branches_body,
+                                                    headers={'content-type': 'application/json'})
+            if branches_response_forecast.status_code == 200:
+                try:
+                    branches_image_urls = branches_response_forecast.json()
+                except:
+                    print("Error decoding JSON from LSTM service for branches")
                     branches_image_urls = {
                         "model_loss_image_url": "",
                         "lstm_generated_image_url": "",
                         "all_issues_data_image": ""
                     }
-            except Exception as e:
-                print(f"Error getting branches forecasts: {str(e)}")
-                # Set default image URLs based on model type
+            else:
                 branches_image_urls = {
                     "model_loss_image_url": "",
                     "lstm_generated_image_url": "",
                     "all_issues_data_image": ""
                 }
-        else:
-            print(f"Not enough branch data for forecasting: {len(branches_for_forecast)} points (minimum 50 required)")
-            # Set default empty image URLs if insufficient data
+        except Exception as e:
+            print(f"Error getting branches forecasts: {str(e)}")
+            # Set default image URLs based on model type
             branches_image_urls = {
                 "model_loss_image_url": "",
                 "lstm_generated_image_url": "",
                 "all_issues_data_image": ""
             }
+
+    elif data_type == 'contributors':
+        # Fetch and process contributors data using GraphQL API
+        contributors_response = fetch_github_contributors(repo_name, today, headers)
+        
+        # Process contributors data
+        df_contributors = pd.DataFrame(contributors_response)
+        
+        # Format contributors data for frontend
+        contributors_data = format_contributors_data(df_contributors) if not df_contributors.empty else []
+        
+        # Prepare data for forecasting service
+        contributors_for_forecast = []
+        for contributor in contributors_response:
+            contrib_modified = {}
+            contrib_modified['issue_number'] = contributor.get('contributor_name', 'unknown')[:8]  # Use first 8 chars of name as ID
+            contrib_modified['created_at'] = contributor.get('first_contribution_date')  # Use first contribution date
+            contributors_for_forecast.append(contrib_modified)
+        
+        contributors_body = {
+            "issues": contributors_for_forecast,
+            "type": "created_at",
+            "repo": repo_name.split("/")[1] + "_contributors"
+        }
+        
+        # Get forecasts for contributors
+        try:
+            contributors_response_forecast = requests.post(FORECAST_API_URL,
+                                                    json=contributors_body,
+                                                    headers={'content-type': 'application/json'})
+            contributors_image_urls = contributors_response_forecast.json()
+        except Exception as e:
+            print(f"Error getting contributors forecasts: {str(e)}")
+            # Set default image URLs based on model type
+            if model_type == 'lstm':
+                contributors_image_urls = {
+                    "model_loss_image_url": "",
+                    "lstm_generated_image_url": "",
+                    "all_issues_data_image": ""
+                }
+            else:  # statsmodel or prophet
+                contributors_image_urls = {
+                    "model_loss_image_url": "",
+                    "lstm_generated_image_url": "",
+                    "all_issues_data_image": ""
+                }
 
     # Create response with the requested data
     json_response = {
@@ -594,6 +779,7 @@ def github():
         "pulls": pulls_data,
         "commits": commits_data,
         "branches": branches_data,
+        "contributors": contributors_data,
         "starCount": repository["stargazers_count"],
         "forkCount": repository["forks_count"],
         "createdAtImageUrls": created_at_image_urls,
@@ -601,6 +787,7 @@ def github():
         "pullsImageUrls": pulls_image_urls,
         "commitsImageUrls": commits_image_urls,
         "branchesImageUrls": branches_image_urls,
+        "contributorsImageUrls": contributors_image_urls,
     }
     
     # Return the response back to client (React app)
