@@ -21,7 +21,7 @@ from flask_cors import CORS
 import json
 import dateutil.relativedelta
 from dateutil import *
-from datetime import date
+from datetime import date, datetime
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -63,6 +63,145 @@ def health():
     }), 200
 
 '''
+Helper function to fetch GitHub commits data using GraphQL API
+GraphQL is more efficient for fetching complex data like commits
+'''
+def fetch_github_commits(repo_name, today, headers, months=12):
+    GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+    response_data = []
+    
+    # Split repository name
+    owner, name = repo_name.split('/')
+    
+    # Iterate through the last 12 months
+    for i in range(months):
+        last_month = today + dateutil.relativedelta.relativedelta(months=-1)
+        
+        # Format dates for GraphQL query
+        end_date = today.strftime("%Y-%m-%dT%H:%M:%SZ")
+        start_date = last_month.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        # Variables for pagination
+        has_next_page = True
+        cursor = None
+        month_commit_count = 0
+        
+        # Retrieve commits with pagination (up to 500 per month)
+        while has_next_page and month_commit_count < 500:
+            # Construct the cursor part of the query
+            cursor_string = f', after: "{cursor}"' if cursor else ''
+            
+            # GraphQL query to fetch commits with author and date information
+            query = """
+            {
+              repository(owner: "%s", name: "%s") {
+                defaultBranchRef {
+                  target {
+                    ... on Commit {
+                      history(first: 100%s, since: "%s", until: "%s") {
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                        nodes {
+                          oid
+                          committedDate
+                          message
+                          author {
+                            name
+                            email
+                            user {
+                              login
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """ % (owner, name, cursor_string, start_date, end_date)
+            
+            # Make POST request to GitHub GraphQL API
+            graphql_response = requests.post(
+                GITHUB_GRAPHQL_URL,
+                json={"query": query},
+                headers=headers
+            )
+            
+            # Process response
+            try:
+                result = graphql_response.json()
+                
+                if 'errors' in result:
+                    print(f"GraphQL Error: {result['errors']}")
+                    break
+                    
+                history = result.get('data', {}).get('repository', {}).get('defaultBranchRef', {}).get('target', {}).get('history', {})
+                commits = history.get('nodes', [])
+                page_info = history.get('pageInfo', {})
+                
+                # Extract pagination info
+                has_next_page = page_info.get('hasNextPage', False)
+                cursor = page_info.get('endCursor')
+                
+                batch_size = len(commits)
+                month_commit_count += batch_size
+                
+                if batch_size == 0:
+                    break
+                
+                for commit in commits:
+                    data = {}
+                    data['commit_hash'] = commit['oid']
+                    data['committed_at'] = commit['committedDate'][:10]  # Just keep the date part
+                    data['message'] = commit['message'].split('\n')[0][:100]  # First line, truncate long messages
+                    
+                    # Author information
+                    author = commit['author']
+                    data['author_name'] = author['name']
+                    data['author_email'] = author['email']
+                    data['author_login'] = author.get('user', {}).get('login', 'unknown')
+                    
+                    response_data.append(data)
+                    
+                # If we got fewer than 100 commits, there are no more to fetch
+                if batch_size < 100:
+                    has_next_page = False
+                    
+            except Exception as e:
+                print(f"Error processing commits: {str(e)}")
+                has_next_page = False
+                
+        today = last_month
+    
+    return response_data
+
+'''
+Helper function to format GitHub commits data for the frontend
+'''
+def format_commits_data(df):
+    if df.empty:
+        return []
+        
+    # Monthly Commits
+    commit_dates = df['committed_at']
+    month_commits = pd.to_datetime(
+        pd.Series(commit_dates), format='%Y-%m-%d')
+    month_commits.index = month_commits.dt.to_period('m')
+    month_commits = month_commits.groupby(level=0).size()
+    month_commits = month_commits.reindex(pd.period_range(
+        month_commits.index.min(), month_commits.index.max(), freq='m'), fill_value=0)
+    month_commits_dict = month_commits.to_dict()
+    commits_data = []
+    for key in month_commits_dict.keys():
+        array = [str(key), month_commits_dict[key]]
+        commits_data.append(array)
+        
+    return commits_data
+
+'''
 API route path is  "/api/github"
 This API will accept only POST request
 '''
@@ -71,7 +210,7 @@ def github():
     body = request.get_json()
     # Extract the choosen repositories from the request
     repo_name = body['repository']
-    # Extract the data type from the request (issues or pulls)
+    # Extract the data type from the request (issues, pulls, or commits)
     data_type = body.get('dataType', 'issues')  # Default to issues if not specified
     # Extract the model type from the request (lstm or statsmodel)
     model_type = body.get('modelType', 'lstm')  # Default to lstm if not specified
@@ -98,9 +237,11 @@ def github():
     created_at_issues = []
     closed_at_issues = []
     pulls_data = []
+    commits_data = []
     created_at_image_urls = {}
     closed_at_image_urls = {}
     pulls_image_urls = {}
+    commits_image_urls = {}
 
     # Check if we're in development environment
     IS_DEV_ENV = os.environ.get('FLASK_ENV', '') == 'development'
@@ -201,17 +342,65 @@ def github():
                     "all_data_image_url": "",
                     "forecast_values": []
                 }
+    
+    elif data_type == 'commits':
+        # Fetch and process commits data using GraphQL API
+        commits_response = fetch_github_commits(repo_name, today, headers)
+        
+        # Process commits data
+        df_commits = pd.DataFrame(commits_response)
+        
+        # Format commits data for frontend
+        commits_data = format_commits_data(df_commits) if not df_commits.empty else []
+        
+        # Prepare data for forecasting service
+        commits_for_forecast = []
+        for commit in commits_response:
+            commit_modified = {}
+            commit_modified['issue_number'] = commit['commit_hash'][:8]  # Use first 8 chars of hash as ID
+            commit_modified['created_at'] = commit['committed_at']  # Use commit date
+            commits_for_forecast.append(commit_modified)
+        
+        commits_body = {
+            "issues": commits_for_forecast,
+            "type": "created_at",
+            "repo": repo_name.split("/")[1] + "_commits"
+        }
+        
+        # Get forecasts for commits
+        try:
+            commits_response_forecast = requests.post(FORECAST_API_URL,
+                                                    json=commits_body,
+                                                    headers={'content-type': 'application/json'})
+            commits_image_urls = commits_response_forecast.json()
+        except Exception as e:
+            print(f"Error getting commits forecasts: {str(e)}")
+            # Set default image URLs based on model type
+            if model_type == 'lstm':
+                commits_image_urls = {
+                    "model_loss_image_url": "",
+                    "lstm_generated_image_url": "",
+                    "all_issues_data_image": ""
+                }
+            else:  # statsmodel
+                commits_image_urls = {
+                    "model_loss_image_url": "",
+                    "lstm_generated_image_url": "",
+                    "all_issues_data_image": ""
+                }
 
     # Create response with the requested data
     json_response = {
         "created": created_at_issues,
         "closed": closed_at_issues,
         "pulls": pulls_data,
+        "commits": commits_data,
         "starCount": repository["stargazers_count"],
         "forkCount": repository["forks_count"],
         "createdAtImageUrls": created_at_image_urls,
         "closedAtImageUrls": closed_at_image_urls,
         "pullsImageUrls": pulls_image_urls,
+        "commitsImageUrls": commits_image_urls,
     }
     
     # Return the response back to client (React app)
@@ -240,62 +429,84 @@ def fetch_github_data(repo_name, today, headers, params, data_type):
         # Search query will create a query to fetch data for a given repository in a given time range
         search_query = types + ' ' + repo + ' ' + ranges
 
-        # Append the search query to the GitHub API URL 
-        query_url = GITHUB_URL + "search/issues?q=" + search_query + "&" + per_page
+        # Variables for pagination
+        page = 1
+        has_more_pages = True
+        month_item_count = 0
         
-        # requsets.get will fetch requested query_url from the GitHub API
-        search_results = requests.get(query_url, headers=headers, params=params)
-        
-        # Convert the data obtained from GitHub API to JSON format
-        search_results = search_results.json()
-        results_items = []
-        
-        try:
-            # Extract "items" from search results
-            results_items = search_results.get("items")
-        except KeyError:
-            error = {"error": "Data Not Available"}
-            resp = Response(json.dumps(error), mimetype='application/json')
-            resp.status_code = 500
-            return resp
+        # Get up to 500 items per month with pagination
+        while has_more_pages and month_item_count < 500:
+            # Append the search query to the GitHub API URL 
+            query_url = GITHUB_URL + f"search/issues?q={search_query}&{per_page}&page={page}"
             
-        if results_items is None:
-            continue
+            # requests.get will fetch requested query_url from the GitHub API
+            search_results = requests.get(query_url, headers=headers, params=params)
             
-        for item in results_items:
-            label_name = []
-            data = {}
-            current_item = item
+            # Convert the data obtained from GitHub API to JSON format
+            search_results = search_results.json()
+            results_items = []
             
-            # Get issue/PR number
-            data['issue_number'] = current_item["number"]
-            
-            # Get created date
-            data['created_at'] = current_item["created_at"][0:10]
-            
-            if current_item["closed_at"] == None:
-                data['closed_at'] = current_item["closed_at"]
-            else:
-                # Get closed date
-                data['closed_at'] = current_item["closed_at"][0:10]
+            try:
+                # Extract "items" from search results
+                results_items = search_results.get("items", [])
+                total_count = search_results.get("total_count", 0)
                 
-            for label in current_item["labels"]:
-                # Get label name
-                label_name.append(label["name"])
+                batch_size = len(results_items)
+                month_item_count += batch_size
                 
-            data['labels'] = label_name
-            
-            # It gives state like closed or open
-            data['State'] = current_item["state"]
-            
-            # Get Author
-            data['Author'] = current_item["user"]["login"]
-            
-            # Add a flag to identify if it's a pull request
-            data['is_pull_request'] = 'pull_request' in current_item
-            
-            response_data.append(data)
-
+                if batch_size == 0:
+                    has_more_pages = False
+                    break
+                
+                for item in results_items:
+                    label_name = []
+                    data = {}
+                    current_item = item
+                    
+                    # Get issue/PR number
+                    data['issue_number'] = current_item["number"]
+                    
+                    # Get created date
+                    data['created_at'] = current_item["created_at"][0:10]
+                    
+                    if current_item["closed_at"] == None:
+                        data['closed_at'] = current_item["closed_at"]
+                    else:
+                        # Get closed date
+                        data['closed_at'] = current_item["closed_at"][0:10]
+                        
+                    for label in current_item["labels"]:
+                        # Get label name
+                        label_name.append(label["name"])
+                        
+                    data['labels'] = label_name
+                    
+                    # It gives state like closed or open
+                    data['State'] = current_item["state"]
+                    
+                    # Get Author
+                    data['Author'] = current_item["user"]["login"]
+                    
+                    # Add a flag to identify if it's a pull request
+                    data['is_pull_request'] = 'pull_request' in current_item
+                    
+                    response_data.append(data)
+                
+                # Check if we have more pages
+                page += 1
+                has_more_pages = batch_size == 100 and month_item_count < total_count
+                    
+            except KeyError as e:
+                print(f"API Error: {str(e)}")
+                error = {"error": "Data Not Available"}
+                resp = Response(json.dumps(error), mimetype='application/json')
+                resp.status_code = 500
+                has_more_pages = False
+                
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}")
+                has_more_pages = False
+                
         today = last_month
         
     return response_data
