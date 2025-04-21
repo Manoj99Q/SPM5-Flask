@@ -73,6 +73,8 @@ def github():
     repo_name = body['repository']
     # Extract the data type from the request (issues or pulls)
     data_type = body.get('dataType', 'issues')  # Default to issues if not specified
+    # Extract the model type from the request (lstm or statsmodel)
+    model_type = body.get('modelType', 'lstm')  # Default to lstm if not specified
     
     # Add your own GitHub Token to run it local
     token = os.environ.get(
@@ -103,13 +105,20 @@ def github():
     # Check if we're in development environment
     IS_DEV_ENV = os.environ.get('FLASK_ENV', '') == 'development'
     
-    # Use local LSTM service in dev environment, otherwise use cloud URL
-    if IS_DEV_ENV:
-        LSTM_API_URL = "http://lstm-service:8080/api/forecast"
-    else:
-        # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
-        LSTM_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "api/forecast"
-
+    # Choose endpoint based on model type and use local service in dev environment, otherwise use cloud URL
+    if model_type == 'lstm':
+        if IS_DEV_ENV:
+            FORECAST_API_URL = "http://lstm-service:8080/forecast-lstm"
+        else:
+            # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
+            FORECAST_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "forecast-lstm"
+    else:  # statsmodel
+        if IS_DEV_ENV:
+            FORECAST_API_URL = "http://lstm-service:8080/forecast-statsmodel"
+        else:
+            # Update your Google cloud deployed LSTM app URL (NOTE: DO NOT REMOVE "/")
+            FORECAST_API_URL = os.environ.get("LSTM_API_URL", "https://forecast-service-852131999673.us-central1.run.app/") + "forecast-statsmodel"
+    
     # Process based on data type requested
     if data_type == 'issues':
         # Fetch and process only issues data
@@ -121,7 +130,7 @@ def github():
         # Format issues data for frontend
         created_at_issues, closed_at_issues = format_github_data(df_issues) if not df_issues.empty else ([], [])
         
-        # Prepare data for LSTM forecasting
+        # Prepare data for forecasting
         created_at_body = {
             "issues": issues_response,
             "type": "created_at",
@@ -134,12 +143,12 @@ def github():
         }
         
         # Get forecasts for created issues
-        created_at_response = requests.post(LSTM_API_URL,
+        created_at_response = requests.post(FORECAST_API_URL,
                                            json=created_at_body,
                                            headers={'content-type': 'application/json'})
         
         # Get forecasts for closed issues
-        closed_at_response = requests.post(LSTM_API_URL,
+        closed_at_response = requests.post(FORECAST_API_URL,
                                          json=closed_at_body,
                                          headers={'content-type': 'application/json'})
                                          
@@ -157,7 +166,7 @@ def github():
         # Format pull requests data for frontend
         pulls_data = format_pulls_data(df_pulls) if not df_pulls.empty else []
         
-        # For pull requests, modify the data structure for LSTM service compatibility
+        # For pull requests, modify the data structure for forecasting service compatibility
         pulls_for_lstm = []
         for pull in pulls_response:
             pull_modified = pull.copy()
@@ -172,17 +181,26 @@ def github():
         
         # Get forecasts for pull requests
         try:
-            pulls_response_forecast = requests.post(LSTM_API_URL,
+            pulls_response_forecast = requests.post(FORECAST_API_URL,
                                                   json=pulls_body,
                                                   headers={'content-type': 'application/json'})
             pulls_image_urls = pulls_response_forecast.json()
         except Exception as e:
             print(f"Error getting pull request forecasts: {str(e)}")
-            pulls_image_urls = {
-                "model_loss_image_url": "",
-                "lstm_generated_image_url": "",
-                "all_issues_data_image": ""
-            }
+            # Set default image URLs based on model type
+            if model_type == 'lstm':
+                pulls_image_urls = {
+                    "model_loss_image_url": "",
+                    "lstm_generated_image_url": "",
+                    "all_issues_data_image": ""
+                }
+            else:  # statsmodel
+                pulls_image_urls = {
+                    "model_diag_image_url": "",
+                    "forecast_image_url": "",
+                    "all_data_image_url": "",
+                    "forecast_values": []
+                }
 
     # Create response with the requested data
     json_response = {
